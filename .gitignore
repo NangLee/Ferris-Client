@@ -1,0 +1,15 @@
+/target/
+/dist/
+/.env
+/.env.*
+/.private/
+/local-notes/
+/*PRIVATE*.md
+/*.key
+/*.pem
+/private-keys/
+*.log
+*.osr
+*.osz
+*.osk
+*.mp4

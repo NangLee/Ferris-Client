@@ -1,0 +1,27 @@
+[package]
+name = "ferris-graphics"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Generic sprite rasterizer and media encoder for Ferris"
+publish = false
+
+[[bin]]
+name = "ferris-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+ferris-scene = { path = "../ferris-scene" }
+pollster = "0.4"
+serde_json = "1"
+wgpu = { version = "25", default-features = false, features = ["dx12", "gles", "vulkan", "wgsl"] }
+
+[build-dependencies]
+naga = { version = "25", features = ["wgsl-in"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
