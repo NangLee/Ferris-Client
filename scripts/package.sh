@@ -24,6 +24,7 @@ metadata = json.load(sys.stdin)
 package = next(item for item in metadata["packages"] if item["name"] == "ferris-client")
 root = os.environ["FERRIS_PACKAGE_ROOT"]
 config = {
+    "name": "ferris-client",
     "productName": "Ferris Client", "version": package["version"],
     "identifier": "win.ferrisfun.client", "publisher": "Ferris", "category": "Utility",
     "description": "Contribute your computer to the Ferris osu!taiko replay render queue",

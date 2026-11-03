@@ -87,6 +87,25 @@ pub fn installed(storage: &Storage) -> Option<InstalledRuntime> {
     Some(runtime)
 }
 
+pub async fn ensure_compatible_ffmpeg(
+    storage: &Storage,
+    runtime: &mut InstalledRuntime,
+) -> Result<bool> {
+    if check_ffmpeg(&runtime.ffmpeg, &runtime.ffprobe)
+        .await
+        .is_ok()
+    {
+        return Ok(false);
+    }
+    let (ffmpeg, ffprobe) = detect_ffmpeg().await.context(
+        "The installed FFmpeg cannot run Ferris scene jobs. Install a compatible FFmpeg with libx264 and drawtext, then reconnect.",
+    )?;
+    runtime.ffmpeg = ffmpeg;
+    runtime.ffprobe = ffprobe;
+    storage::write_json(&storage.data.join("runtime.json"), runtime)?;
+    Ok(true)
+}
+
 pub async fn fetch_manifest(api: &Api) -> Result<ReleaseManifest> {
     verify_manifest(api.manifest().await?)
 }
@@ -537,6 +556,34 @@ pub async fn check_ffmpeg(ffmpeg: &Path, ffprobe: &Path) -> Result<()> {
     let filters = command_output(ffmpeg, &["-hide_banner", "-filters"]).await?;
     if !filters.split_whitespace().any(|word| word == "drawtext") {
         bail!("FFmpeg needs the drawtext filter");
+    }
+    // The signed scene worker places this queue option before its raw-video
+    // input. Some newer FFmpeg builds accept the name but expose it only as an
+    // output option, which makes every assigned render fail on its first frame.
+    let input = command_output(
+        ffmpeg,
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-thread_queue_size",
+            "4",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:r=1",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ],
+    )
+    .await
+    .context("FFmpeg cannot accept the scene worker's input queue option")?;
+    if !input.trim().is_empty() {
+        bail!("FFmpeg's scene input compatibility check returned unexpected output");
     }
     Ok(())
 }

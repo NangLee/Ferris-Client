@@ -95,6 +95,7 @@ struct Coordinator {
     token: Option<String>,
     settings: Settings,
     runtime: Option<InstalledRuntime>,
+    gpu_name: Option<String>,
     manifest: Option<ReleaseManifest>,
     active: HashMap<String, RunningJob>,
     events: mpsc::UnboundedSender<Event>,
@@ -145,6 +146,7 @@ impl Coordinator {
             token: None,
             settings,
             runtime,
+            gpu_name: None,
             manifest: None,
             active: HashMap::new(),
             events,
@@ -269,12 +271,21 @@ impl Coordinator {
                 if self.token.is_none() {
                     bail!("Sign in with osu! first");
                 }
-                if self.runtime.is_none() {
-                    bail!("Install the signed render tools before connecting");
+                let runtime = self
+                    .runtime
+                    .as_mut()
+                    .context("Install the signed render tools before connecting")?;
+                let ffmpeg_changed =
+                    runtime::ensure_compatible_ffmpeg(&self.storage, runtime).await?;
+                let runtime_info = runtime.info();
+                self.update(|state| state.runtime = runtime_info);
+                if ffmpeg_changed {
+                    self.log("info", "Selected a compatible FFmpeg for scene rendering.");
                 }
                 if platform_name() == "unsupported" {
                     bail!("This operating system or CPU is not supported by this build");
                 }
+                self.gpu_name = gpu_name(self.settings.render_backend).await;
                 self.connected = true;
                 self.accepting = true;
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
@@ -351,6 +362,9 @@ impl Coordinator {
                     });
                 }
                 self.storage.save_settings(&settings)?;
+                if settings.render_backend != self.settings.render_backend {
+                    self.gpu_name = gpu_name(settings.render_backend).await;
+                }
                 self.settings = settings.clone();
                 self.update(|state| {
                     state.settings = settings;
@@ -564,6 +578,7 @@ impl Coordinator {
             specs: machine_specs(
                 self.settings.share_machine_info,
                 self.settings.render_backend,
+                self.gpu_name.clone(),
             ),
             active_jobs: self
                 .active
@@ -707,7 +722,28 @@ fn is_unauthorized(error: &anyhow::Error) -> bool {
     error.to_string().contains("HTTP 401")
 }
 
-fn machine_specs(share_names: bool, render_backend: RenderBackend) -> MachineSpecs {
+async fn gpu_name(render_backend: RenderBackend) -> Option<String> {
+    if render_backend == RenderBackend::Cpu {
+        return None;
+    }
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+    let info = adapter.get_info();
+    (info.device_type != wgpu::DeviceType::Cpu).then_some(info.name)
+}
+
+fn machine_specs(
+    share_names: bool,
+    render_backend: RenderBackend,
+    gpu_name: Option<String>,
+) -> MachineSpecs {
     let system = sysinfo::System::new_all();
     MachineSpecs {
         render_backend,
@@ -718,7 +754,7 @@ fn machine_specs(share_names: bool, render_backend: RenderBackend) -> MachineSpe
             .unwrap_or_else(|| "Unknown CPU".into()),
         cpu_threads: system.cpus().len().max(1),
         memory_bytes: system.total_memory(),
-        gpu_name: None,
+        gpu_name,
         pc_username: share_names.then(|| {
             std::env::var("USERNAME")
                 .or_else(|_| std::env::var("USER"))
@@ -766,10 +802,15 @@ async fn run_job(
     let result = async {
         let asset = &job.assets[0];
         let archive_path = directory.join("scene.zip");
+        let download_started = Instant::now();
         tokio::select! {
             _ = cancelled.changed() => bail!("Render cancelled by the contributor"),
             result = api.download_asset(token, &asset.url, &archive_path, &asset.sha256, asset.bytes, 300 * 1024 * 1024) => result?,
         }
+        let _ = events.send(Event::Log("info".into(), format!(
+            "Render {id} downloaded {:.1} MiB of scene data in {:.1}s.",
+            asset.bytes as f64 / 1_048_576.0, download_started.elapsed().as_secs_f64(),
+        )));
         let scene_sha256 = asset.sha256.to_ascii_lowercase();
         let authorization = tokio::select! {
             _ = cancelled.changed() => bail!("Render cancelled by the contributor"),
@@ -800,13 +841,24 @@ async fn run_job(
             _ = cancelled.changed() => bail!("Render cancelled by the contributor"),
             _ = api.progress(token, &job.id, &job.lease_token, 0, None) => {},
         }
+        let render_started = Instant::now();
         render_process(runtime, &args, &directory, &job.id, authorization, cancelled.clone(), events).await?;
+        let output_bytes = tokio::fs::metadata(&output).await?.len();
+        let _ = events.send(Event::Log("info".into(), format!(
+            "Render {id} encoded {:.1} MiB in {:.1}s.",
+            output_bytes as f64 / 1_048_576.0, render_started.elapsed().as_secs_f64(),
+        )));
         if *cancelled.borrow() { bail!("Render cancelled by the contributor"); }
         let _ = events.send(Event::Progress(job.id.clone(), 99, "Uploading".into()));
+        let upload_started = Instant::now();
         tokio::select! {
             _ = cancelled.changed() => bail!("Render cancelled by the contributor"),
             result = api.complete(token, &job.upload_url, &job.lease_token, &output) => result?,
         }
+        let _ = events.send(Event::Log("info".into(), format!(
+            "Render {id} uploaded {:.1} MiB in {:.1}s.",
+            output_bytes as f64 / 1_048_576.0, upload_started.elapsed().as_secs_f64(),
+        )));
         Ok(())
     }.await;
     if directory.starts_with(&jobs_root) {

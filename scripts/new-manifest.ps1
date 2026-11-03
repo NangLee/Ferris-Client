@@ -32,5 +32,10 @@ $manifest = [ordered]@{
     }
 }
 $json = $manifest | ConvertTo-Json -Depth 6
-if ($OutputPath) { [IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputPath), $json, [Text.UTF8Encoding]::new($false)) }
+if ($OutputPath) {
+    $manifestOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    $manifestOutputDirectory = [IO.Path]::GetDirectoryName($manifestOutputPath)
+    $null = [IO.Directory]::CreateDirectory($manifestOutputDirectory)
+    [IO.File]::WriteAllText($manifestOutputPath, $json, [Text.UTF8Encoding]::new($false))
+}
 $json
