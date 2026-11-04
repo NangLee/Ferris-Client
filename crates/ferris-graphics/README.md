@@ -12,7 +12,9 @@ The Ferris Client downloads a signed runtime package, verifies an assigned scene
 ferris-worker --scene <DIRECTORY> --out <MP4> --ffmpeg <FFMPEG_EXECUTABLE>
 ```
 
-GPU drawing is the default. `--cpu-renderer` selects the independent CPU rasterizer. GPU initialization failure also falls back to CPU drawing with a log message. Both paths use the same public scene commands. FFmpeg encodes H.264 using `libx264` and mixes the prepared media. GPU drawing and hardware video encoding are separate concerns; this initial worker uses software H.264 encoding for consistent compatibility.
+GPU drawing is the default. `--cpu-renderer` selects the independent CPU rasterizer. GPU initialization failure also falls back to CPU drawing with a log message. Both paths use the same public scene commands. When GPU drawing is active, the worker probes FFmpeg's NVENC encoder with one frame and uses it if available. Otherwise it uses `libx264`. FFmpeg also mixes the prepared media and bounds audio to the video duration.
+
+For Juz's known still-background intro recipe, the worker caches the background and its blur before the timed effects. Other media recipes retain their original FFmpeg graph. The worker logs scene reading, drawing, and FFmpeg pipe time for each render.
 
 `--capabilities` prints the machine readable runtime identity without initializing graphics or starting FFmpeg:
 

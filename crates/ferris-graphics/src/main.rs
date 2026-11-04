@@ -11,7 +11,7 @@ use std::{
     io::{BufReader, Write},
     path::PathBuf,
     process::{Child, ExitCode},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const MAX_VIDEO_BYTES: u64 = 300 * 1024 * 1024;
@@ -118,7 +118,13 @@ fn run() -> Result<()> {
             }
         }
     };
-    let mut command = media::command(&scene, &output, &ffmpeg, &manifest)?;
+    let mut command = media::command(
+        &scene,
+        &output,
+        &ffmpeg,
+        &manifest,
+        matches!(renderer, Renderer::Gpu(_)),
+    )?;
     let child = command.spawn().context("Could not start FFmpeg")?;
     let mut child = ChildGuard(child);
     let mut input = child
@@ -130,8 +136,14 @@ fn run() -> Result<()> {
     let mut textures = HashMap::<u32, usize>::new();
     let mut texture_bytes = 0usize;
     let mut frames = 0u64;
+    let mut scene_read_time = Duration::ZERO;
+    let mut draw_time = Duration::ZERO;
+    let mut encoder_write_time = Duration::ZERO;
     loop {
-        match reader.read_record()? {
+        let read_started = Instant::now();
+        let record = reader.read_record()?;
+        scene_read_time += read_started.elapsed();
+        match record {
             Record::Texture {
                 id,
                 width,
@@ -158,9 +170,14 @@ fn run() -> Result<()> {
             }
             Record::Frame(frame) => {
                 ensure!(frames < manifest.frame_count, "Too many scene frames");
+                let draw_started = Instant::now();
+                let pixels = renderer.draw(&frame)?;
+                draw_time += draw_started.elapsed();
+                let write_started = Instant::now();
                 input
-                    .write_all(renderer.draw(&frame)?)
+                    .write_all(pixels)
                     .context("Could not send the drawn frame to FFmpeg")?;
+                encoder_write_time += write_started.elapsed();
                 frames += 1;
                 if frames == 1
                     || frames == manifest.frame_count
@@ -194,6 +211,12 @@ fn run() -> Result<()> {
     eprintln!(
         "Drawing complete: {frames} frames in {:.2}s",
         started.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "Worker timing: scene read {:.2}s, GPU/CPU draw {:.2}s, FFmpeg pipe {:.2}s",
+        scene_read_time.as_secs_f64(),
+        draw_time.as_secs_f64(),
+        encoder_write_time.as_secs_f64()
     );
     Ok(())
 }

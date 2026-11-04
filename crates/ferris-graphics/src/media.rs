@@ -70,8 +70,38 @@ pub fn checked_file(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-pub fn command(root: &Path, output: &Path, ffmpeg: &Path, manifest: &Manifest) -> Result<Command> {
-    let filter_graph = validate_graph(manifest)?;
+pub fn command(
+    root: &Path,
+    output: &Path,
+    ffmpeg: &Path,
+    manifest: &Manifest,
+    prefer_hardware: bool,
+) -> Result<Command> {
+    let validated_graph = validate_graph(manifest)?;
+    let (mut filter_graph, cached_background) = cache_still_background(manifest, &validated_graph);
+    if cached_background {
+        eprintln!("Media filter: cached still background and intro blur");
+    }
+    let audio_map = if let Some(source) = manifest.media.audio_map.as_deref() {
+        const LIMITED_AUDIO: &str = "[ferris_audio_limited]";
+        ensure!(
+            !filter_graph.contains(LIMITED_AUDIO),
+            "Scene uses the reserved audio output label"
+        );
+        // Juz's media recipe pads silence indefinitely. Bound that stream at
+        // the known video duration so audio cannot run ahead while video is
+        // still being drawn and flood FFmpeg with timestamp corrections.
+        filter_graph.push_str(&format!(
+            ";{source}atrim=duration={:.6},asetpts=PTS-STARTPTS{LIMITED_AUDIO}",
+            manifest.media.duration_seconds
+        ));
+        Some(LIMITED_AUDIO)
+    } else {
+        None
+    };
+    let filter_threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .to_string();
     let mut command = Command::new(ffmpeg);
     command.current_dir(root).args([
         "-hide_banner",
@@ -80,9 +110,9 @@ pub fn command(root: &Path, output: &Path, ffmpeg: &Path, manifest: &Manifest) -
         "-nostdin",
         "-y",
         "-filter_threads",
-        "2",
+        &filter_threads,
         "-filter_complex_threads",
-        "2",
+        &filter_threads,
     ]);
     for input in &manifest.media.inputs {
         command.args([
@@ -133,19 +163,21 @@ pub fn command(root: &Path, output: &Path, ffmpeg: &Path, manifest: &Manifest) -
         "-map",
         &manifest.media.video_map,
     ]);
-    if let Some(audio) = &manifest.media.audio_map {
+    if let Some(audio) = audio_map {
         command.args(["-map", audio, "-c:a", "aac", "-b:a", "192k"]);
     } else {
         command.arg("-an");
     }
+    let nvenc = prefer_hardware && nvenc_available(ffmpeg, manifest.width, manifest.height);
+    if nvenc {
+        eprintln!("Video encoder: h264_nvenc (p4)");
+        command.args(["-c:v", "h264_nvenc", "-preset", "p4"]);
+    } else {
+        eprintln!("Video encoder: libx264 (veryfast)");
+        command.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
+    }
     command
         .args([
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
             "-threads",
             "2",
             "-pix_fmt",
@@ -166,6 +198,113 @@ pub fn command(root: &Path, output: &Path, ffmpeg: &Path, manifest: &Manifest) -
         command.creation_flags(0x08000000);
     }
     Ok(command)
+}
+
+fn nvenc_available(ffmpeg: &Path, width: u32, height: u32) -> bool {
+    let source = format!("color=c=black:s={width}x{height}:r=1");
+    Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-frames:v",
+            "1",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn cache_still_background(manifest: &Manifest, graph: &str) -> (String, bool) {
+    if graph.contains("[bg_clear_static]") || graph.contains("[bg_soft_static]") {
+        return (graph.to_owned(), false);
+    }
+    if !matches!(
+        manifest.media.inputs.first(),
+        Some(MediaInput::File {
+            mode: FileMode::Still,
+            ..
+        })
+    ) {
+        return (graph.to_owned(), false);
+    }
+
+    // Juz describes a still image as a video stream when the intro or results
+    // fades are present. FFmpeg then scales and blurs the same image for every
+    // frame. Cache those two stills before their time-dependent effects.
+    const FADE_TO_SPLIT: &str = "[bgsharp];[bgsharp]split[bg_clear][bg_intro_source];[bg_intro_source]boxblur=20:2,eq=brightness=-0.22[bg_soft];[bg_clear][bg_soft]blend=all_expr='";
+    let Some(after_input) = graph.strip_prefix("[0:v]") else {
+        return (graph.to_owned(), false);
+    };
+    let Some((base, after_base)) = after_input.split_once(",fade=") else {
+        return (graph.to_owned(), false);
+    };
+    let Some((fade, after_fade)) = after_base.split_once(FADE_TO_SPLIT) else {
+        return (graph.to_owned(), false);
+    };
+    if !fade.starts_with("t=out:st=") || !fade.ends_with(":color=black") {
+        return (graph.to_owned(), false);
+    }
+    let Some((blend, remaining)) = after_fade.split_once("'[bg];") else {
+        return (graph.to_owned(), false);
+    };
+    let Some((intro_start, intro_end, intro_duration)) = juz_intro_blend(blend) else {
+        return (graph.to_owned(), false);
+    };
+    let loop_still = format!(
+        "loop=loop=-1:size=1:start=0,settb=expr=1/{},setpts=N",
+        manifest.fps
+    );
+    let optimized = format!(
+        "[0:v]{base},split[bg_clear_static][bg_soft_static];\
+         [bg_clear_static]{loop_still},fade={fade}[bg_clear];\
+         [bg_soft_static]boxblur=20:2,eq=brightness=-0.22,format=rgba,{loop_still},fade=t=out:st={intro_start}:d={intro_duration}:alpha=1[bg_soft];\
+         [bg_clear][bg_soft]overlay=shortest=0:format=auto:enable='lt(t,{intro_end})'[bg];{remaining}"
+    );
+    (optimized, true)
+}
+
+fn juz_intro_blend(blend: &str) -> Option<(&str, &str, &str)> {
+    let rest = blend.strip_prefix(r"if(lt(T\,")?;
+    let (start, rest) = rest.split_once(r"),B,if(lt(T\,")?;
+    let (end, rest) = rest.split_once("),A*((T-")?;
+    let (repeat_start, rest) = rest.split_once(")/")?;
+    let (duration, rest) = rest.split_once(")+B*((")?;
+    let (repeat_end, rest) = rest.split_once("-T)/")?;
+    let repeat_duration = rest.strip_suffix("),A))")?;
+    if start != repeat_start || end != repeat_end || duration != repeat_duration {
+        return None;
+    }
+    let (start_seconds, end_seconds, duration_seconds) = (
+        start.parse::<f64>().ok()?,
+        end.parse::<f64>().ok()?,
+        duration.parse::<f64>().ok()?,
+    );
+    if !start_seconds.is_finite()
+        || !end_seconds.is_finite()
+        || !duration_seconds.is_finite()
+        || !(0.0..=30.0).contains(&start_seconds)
+        || end_seconds > 30.0
+        || (end_seconds - start_seconds - duration_seconds).abs() > 0.001
+        || duration_seconds <= 0.0
+    {
+        return None;
+    }
+    Some((start, end, duration))
 }
 
 fn validate_graph(manifest: &Manifest) -> Result<String> {
