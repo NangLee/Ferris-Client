@@ -10,6 +10,9 @@ use std::{
 };
 
 const INPUT_FORMATS: &str = "rawvideo,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe,gif,image2,image2pipe,apng,mov,matroska,webm,avi,mp3,wav,ogg,flac,aac";
+const TARGET_VIDEO_BYTES: u64 = 268 * 1024 * 1024;
+const AUDIO_BITRATE: u64 = 192_000;
+const MAX_VIDEO_BITRATE: u64 = 50_000_000;
 const FILTERS: &[&str] = &[
     "scale",
     "crop",
@@ -78,6 +81,19 @@ pub fn command(
     prefer_hardware: bool,
 ) -> Result<Command> {
     let validated_graph = validate_graph(manifest)?;
+    let video_bitrate = video_bitrate_limit(
+        manifest.width,
+        manifest.height,
+        manifest.fps,
+        manifest.media.duration_seconds,
+        manifest.media.audio_map.is_some(),
+    )?;
+    let rate = video_bitrate.to_string();
+    let buffer = (video_bitrate * 2).to_string();
+    eprintln!(
+        "Video rate limit: {:.2} Mb/s (268 MiB output target)",
+        video_bitrate as f64 / 1_000_000.0
+    );
     let (mut filter_graph, cached_background) = cache_still_background(manifest, &validated_graph);
     if cached_background {
         eprintln!("Media filter: cached still background and intro blur");
@@ -171,11 +187,23 @@ pub fn command(
     let nvenc = prefer_hardware && nvenc_available(ffmpeg, manifest.width, manifest.height);
     if nvenc {
         eprintln!("Video encoder: h264_nvenc (p4)");
-        command.args(["-c:v", "h264_nvenc", "-preset", "p4"]);
+        command.args([
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-cq",
+            "20",
+            "-b:v",
+            &rate,
+        ]);
     } else {
         eprintln!("Video encoder: libx264 (veryfast)");
         command.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
     }
+    command.args(["-maxrate", &rate, "-bufsize", &buffer]);
     command
         .args([
             "-threads",
@@ -198,6 +226,31 @@ pub fn command(
         command.creation_flags(0x08000000);
     }
     Ok(command)
+}
+
+fn video_bitrate_limit(
+    width: u32,
+    height: u32,
+    fps: u32,
+    duration_seconds: f64,
+    has_audio: bool,
+) -> Result<u64> {
+    ensure!(
+        duration_seconds.is_finite() && duration_seconds > 0.0,
+        "Invalid scene duration"
+    );
+    let audio_bitrate = if has_audio { AUDIO_BITRATE } else { 0 };
+    let available = ((TARGET_VIDEO_BYTES as f64 * 8.0 / duration_seconds) - audio_bitrate as f64)
+        .floor()
+        .min(MAX_VIDEO_BITRATE as f64);
+    let quality_floor = (width as f64 * height as f64 * fps as f64 * 0.035)
+        .ceil()
+        .max(1_500_000.0);
+    ensure!(
+        available >= quality_floor,
+        "result_too_large: this scene cannot fit the community upload limit at usable video quality"
+    );
+    Ok(available as u64)
 }
 
 fn nvenc_available(ffmpeg: &Path, width: u32, height: u32) -> bool {
@@ -424,4 +477,33 @@ fn split(value: &str, delimiter: char) -> Result<Vec<&str>> {
     }
     parts.push(&value[start..]);
     Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_VIDEO_BITRATE, TARGET_VIDEO_BYTES, video_bitrate_limit};
+
+    #[test]
+    fn six_minute_scene_has_room_for_audio_and_container() {
+        let seconds = 22_301.0 / 60.0;
+        let rate = video_bitrate_limit(1280, 720, 60, seconds, true).unwrap();
+        assert!((5_500_000..6_000_000).contains(&rate));
+        let planned_bytes = (rate as f64 + 192_000.0) * seconds / 8.0;
+        assert!(planned_bytes <= TARGET_VIDEO_BYTES as f64);
+        assert!(planned_bytes < (300 * 1024 * 1024) as f64);
+    }
+
+    #[test]
+    fn long_scene_rejects_unusable_video_rate_before_rendering() {
+        let error = video_bitrate_limit(1920, 1080, 60, 3600.0, true).unwrap_err();
+        assert!(error.to_string().starts_with("result_too_large:"));
+    }
+
+    #[test]
+    fn short_scene_uses_a_reasonable_rate_ceiling() {
+        assert_eq!(
+            video_bitrate_limit(1280, 720, 60, 30.0, false).unwrap(),
+            MAX_VIDEO_BITRATE
+        );
+    }
 }

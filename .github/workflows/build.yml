@@ -30,7 +30,12 @@ jobs:
       - name: Require the pinned public key
         shell: bash
         run: |
-          [[ -n "$FERRIS_UPDATE_PUBLIC_KEY" ]] || { echo 'Set repository variable FERRIS_UPDATE_PUBLIC_KEY.' >&2; exit 1; }
+          if [[ -z "$FERRIS_UPDATE_PUBLIC_KEY" ]]; then
+            [[ -f public-signing-key.txt ]] || { echo 'The committed public signing key is missing.' >&2; exit 1; }
+            FERRIS_UPDATE_PUBLIC_KEY=$(tr -d '\r\n' < public-signing-key.txt)
+            echo "FERRIS_UPDATE_PUBLIC_KEY=$FERRIS_UPDATE_PUBLIC_KEY" >> "$GITHUB_ENV"
+          fi
+          [[ -n "$FERRIS_UPDATE_PUBLIC_KEY" ]] || { echo 'The public signing key is empty.' >&2; exit 1; }
       - name: Install Linux build and packaging dependencies
         if: runner.os == 'Linux'
         shell: bash

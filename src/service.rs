@@ -285,7 +285,13 @@ impl Coordinator {
                 if platform_name() == "unsupported" {
                     bail!("This operating system or CPU is not supported by this build");
                 }
-                self.gpu_name = gpu_name(self.settings.render_backend).await;
+                self.gpu_name = match self.settings.render_backend {
+                    RenderBackend::Gpu => Some(gpu_name().await?),
+                    RenderBackend::Cpu => None,
+                };
+                if let Some(name) = &self.gpu_name {
+                    self.log("info", &format!("GPU drawing adapter ready: {name}."));
+                }
                 self.connected = true;
                 self.accepting = true;
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
@@ -345,6 +351,17 @@ impl Coordinator {
                 }
                 let api = Api::new(&settings.server_url)?;
                 settings.server_url = api.base.as_str().trim_end_matches('/').to_owned();
+                let new_gpu_name = if settings.render_backend != self.settings.render_backend {
+                    if !self.active.is_empty() {
+                        bail!("Finish current renders before changing the drawing backend");
+                    }
+                    match settings.render_backend {
+                        RenderBackend::Gpu => Some(gpu_name().await?),
+                        RenderBackend::Cpu => None,
+                    }
+                } else {
+                    self.gpu_name.clone()
+                };
                 if settings.server_url != self.settings.server_url {
                     if self.connected || !self.active.is_empty() || self.runtime_busy {
                         bail!("Disconnect and finish current work before changing servers");
@@ -362,9 +379,7 @@ impl Coordinator {
                     });
                 }
                 self.storage.save_settings(&settings)?;
-                if settings.render_backend != self.settings.render_backend {
-                    self.gpu_name = gpu_name(settings.render_backend).await;
-                }
+                self.gpu_name = new_gpu_name;
                 self.settings = settings.clone();
                 self.update(|state| {
                     state.settings = settings;
@@ -722,10 +737,7 @@ fn is_unauthorized(error: &anyhow::Error) -> bool {
     error.to_string().contains("HTTP 401")
 }
 
-async fn gpu_name(render_backend: RenderBackend) -> Option<String> {
-    if render_backend == RenderBackend::Cpu {
-        return None;
-    }
+async fn gpu_name() -> Result<String> {
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -734,9 +746,29 @@ async fn gpu_name(render_backend: RenderBackend) -> Option<String> {
             force_fallback_adapter: false,
         })
         .await
-        .ok()?;
+        .context("GPU mode needs a working graphics driver. Select CPU mode or install a Vulkan/DirectX graphics driver")?;
     let info = adapter.get_info();
-    (info.device_type != wgpu::DeviceType::Cpu).then_some(info.name)
+    if !matches!(
+        info.device_type,
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+    ) {
+        bail!(
+            "GPU mode found '{}' ({:?}), which is not a hardware graphics adapter. Select CPU mode or fix the GPU driver",
+            info.name,
+            info.device_type
+        );
+    }
+    let mut limits = wgpu::Limits::default();
+    limits.max_texture_dimension_2d = 8192;
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("Ferris GPU preflight"),
+            required_limits: limits,
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("Could not create a Ferris graphics device on '{}'. Select CPU mode or fix the GPU driver", info.name))?;
+    Ok(info.name)
 }
 
 fn machine_specs(

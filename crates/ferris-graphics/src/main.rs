@@ -110,13 +110,10 @@ fn run() -> Result<()> {
     let mut renderer = if cpu {
         Renderer::Cpu(cpu::CpuRenderer::new(manifest.width, manifest.height))
     } else {
-        match pollster::block_on(gpu::GpuRenderer::new(manifest.width, manifest.height)) {
-            Ok(renderer) => Renderer::Gpu(renderer),
-            Err(error) => {
-                eprintln!("GPU unavailable ({error:#}); using CPU drawing.");
-                Renderer::Cpu(cpu::CpuRenderer::new(manifest.width, manifest.height))
-            }
-        }
+        Renderer::Gpu(
+            pollster::block_on(gpu::GpuRenderer::new(manifest.width, manifest.height))
+                .context("GPU rendering is unavailable. Select CPU mode in Ferris Client or fix the graphics driver")?,
+        )
     };
     let mut command = media::command(
         &scene,

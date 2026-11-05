@@ -12,7 +12,9 @@ The Ferris Client downloads a signed runtime package, verifies an assigned scene
 ferris-worker --scene <DIRECTORY> --out <MP4> --ffmpeg <FFMPEG_EXECUTABLE>
 ```
 
-GPU drawing is the default. `--cpu-renderer` selects the independent CPU rasterizer. GPU initialization failure also falls back to CPU drawing with a log message. Both paths use the same public scene commands. When GPU drawing is active, the worker probes FFmpeg's NVENC encoder with one frame and uses it if available. Otherwise it uses `libx264`. FFmpeg also mixes the prepared media and bounds audio to the video duration.
+GPU drawing is the default and requires a working integrated or discrete graphics adapter. The client checks the adapter before connecting; the worker fails promptly if GPU initialization later fails. Select CPU mode in the client to use the independent CPU rasterizer (`--cpu-renderer`). Both paths use the same public scene commands. When GPU drawing is active, the worker probes FFmpeg's NVENC encoder with one frame and uses it if available. Otherwise it uses `libx264`. FFmpeg also mixes the prepared media and bounds audio to the video duration.
+
+Community output has a 300 MiB upload limit. The worker budgets 268 MiB for encoded video and audio, limits either encoder's bitrate to fit the scene duration, and checks the finished file. If the required bitrate falls below the configured quality floor, it rejects the scene before drawing frames so Ferris can use the VPS renderer instead.
 
 For Juz's known still-background intro recipe, the worker caches the background and its blur before the timed effects. Other media recipes retain their original FFmpeg graph. The worker logs scene reading, drawing, and FFmpeg pipe time for each render.
 

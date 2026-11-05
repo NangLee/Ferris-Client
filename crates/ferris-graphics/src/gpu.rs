@@ -57,6 +57,15 @@ impl GpuRenderer {
             .await
             .context("No graphics adapter is available")?;
         let adapter_info = adapter.get_info();
+        ensure!(
+            matches!(
+                adapter_info.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+            ),
+            "GPU mode selected a software or virtual adapter: {} ({:?})",
+            adapter_info.name,
+            adapter_info.device_type
+        );
         let mut limits = wgpu::Limits::default();
         limits.max_texture_dimension_2d = 8192;
         let (device, queue) = adapter
