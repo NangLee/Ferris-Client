@@ -104,12 +104,13 @@ pub fn command(
             !filter_graph.contains(LIMITED_AUDIO),
             "Scene uses the reserved audio output label"
         );
-        // Juz's media recipe pads silence indefinitely. Bound that stream at
-        // the known video duration so audio cannot run ahead while video is
-        // still being drawn and flood FFmpeg with timestamp corrections.
+        // Juz's media recipe may pad silence indefinitely. Bound audio by
+        // sample count, then assign timestamps from the resulting samples.
+        // This avoids FFmpeg overflowing undefined packet timestamps when
+        // the audio graph reaches its end before the video pipe finishes.
+        let audio_samples = (manifest.media.duration_seconds * 48_000.0).ceil() as u64;
         filter_graph.push_str(&format!(
-            ";{source}atrim=duration={:.6},asetpts=PTS-STARTPTS{LIMITED_AUDIO}",
-            manifest.media.duration_seconds
+            ";{source}aresample=48000,atrim=end_sample={audio_samples},asetpts=N/SR/TB{LIMITED_AUDIO}"
         ));
         Some(LIMITED_AUDIO)
     } else {

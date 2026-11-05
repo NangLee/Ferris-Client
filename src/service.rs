@@ -885,7 +885,7 @@ async fn run_job(
         let upload_started = Instant::now();
         tokio::select! {
             _ = cancelled.changed() => bail!("Render cancelled by the contributor"),
-            result = api.complete(token, &job.upload_url, &job.lease_token, &output) => result?,
+            result = api.complete(token, &job.id, &job.upload_url, &job.lease_token, &output) => result?,
         }
         let _ = events.send(Event::Log("info".into(), format!(
             "Render {id} uploaded {:.1} MiB in {:.1}s.",

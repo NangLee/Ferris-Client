@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use base64::{
     Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -111,10 +111,45 @@ pub async fn fetch_manifest(api: &Api) -> Result<ReleaseManifest> {
 }
 
 fn decode_bytes(text: &str) -> Result<Vec<u8>> {
+    let text = text.trim();
     URL_SAFE_NO_PAD
         .decode(text)
+        .or_else(|_| URL_SAFE.decode(text))
+        .or_else(|_| STANDARD_NO_PAD.decode(text))
         .or_else(|_| STANDARD.decode(text))
         .context("Invalid base64 in signed release metadata")
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::decode_bytes;
+
+    #[test]
+    fn pinned_public_key_decodes() {
+        let key = include_str!("../public-signing-key.txt").trim();
+        assert_eq!(decode_bytes(key).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn padded_url_safe_key_decodes() {
+        let key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, [255u8; 32]);
+        assert!(key.contains('_') && key.ends_with('='));
+        assert_eq!(decode_bytes(&key).unwrap(), [255u8; 32]);
+    }
+
+    #[test]
+    fn malformed_padding_is_rejected() {
+        assert!(decode_bytes("Zm9v===").is_err());
+    }
+
+    #[test]
+    fn unpadded_url_safe_signature_decodes() {
+        let signature = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [255u8; 64],
+        );
+        assert_eq!(decode_bytes(&signature).unwrap().len(), 64);
+    }
 }
 
 pub fn verify_manifest(envelope: serde_json::Value) -> Result<ReleaseManifest> {
@@ -131,7 +166,8 @@ pub fn verify_manifest(envelope: serde_json::Value) -> Result<ReleaseManifest> {
 pub(crate) fn verify_signed_payload(envelope: serde_json::Value, limit: usize) -> Result<Vec<u8>> {
     let public_key = option_env!("FERRIS_UPDATE_PUBLIC_KEY")
         .filter(|key| !key.is_empty()).context("This build has no pinned update key. Ask the Ferris operator for a signed production build.")?;
-    let key_bytes: [u8; 32] = decode_bytes(public_key)?
+    let key_bytes: [u8; 32] = decode_bytes(public_key)
+        .context("Invalid pinned update key encoding")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("The pinned update key is invalid"))?;
     let payload = decode_bytes(
@@ -139,7 +175,8 @@ pub(crate) fn verify_signed_payload(envelope: serde_json::Value, limit: usize) -
             .get("payload")
             .and_then(|v| v.as_str())
             .context("Missing signed release payload")?,
-    )?;
+    )
+    .context("Invalid signed payload encoding")?;
     if payload.len() > limit {
         bail!("The signed payload is too large");
     }
@@ -148,7 +185,8 @@ pub(crate) fn verify_signed_payload(envelope: serde_json::Value, limit: usize) -
             .get("signature")
             .and_then(|v| v.as_str())
             .context("Missing release signature")?,
-    )?;
+    )
+    .context("Invalid release signature encoding")?;
     let key = VerifyingKey::from_bytes(&key_bytes)?;
     key.verify_strict(&payload, &Signature::from_slice(&signature)?)
         .context("The release signature does not match this client's pinned key")?;

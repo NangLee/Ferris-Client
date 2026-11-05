@@ -4,11 +4,13 @@ use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
-use tokio::io::AsyncWriteExt;
+use std::{io::SeekFrom, path::Path, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
 const JSON_LIMIT: usize = 2 * 1024 * 1024;
+const DIRECT_UPLOAD_LIMIT: u64 = 80 * 1024 * 1024;
+const VIDEO_PART_SIZE: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Api {
@@ -178,13 +180,28 @@ impl Api {
         Ok(())
     }
 
-    pub async fn complete(&self, token: &str, url: &str, lease: &str, video: &Path) -> Result<()> {
+    pub async fn complete(
+        &self,
+        token: &str,
+        id: &str,
+        url: &str,
+        lease: &str,
+        video: &Path,
+    ) -> Result<()> {
+        let id = uuid::Uuid::parse_str(id).context("Invalid job ID")?;
+        let expected = self.endpoint(&format!("jobs/{id}/complete"))?;
+        if self.same_origin_url(url)? != expected {
+            bail!("Unexpected video upload endpoint");
+        }
         let size = tokio::fs::metadata(video).await?.len();
         if size == 0 {
             bail!("The renderer produced an empty video");
         }
         if size > 300 * 1024 * 1024 {
             bail!("result_too_large: rendered video exceeds the 300 MB node upload limit");
+        }
+        if size > DIRECT_UPLOAD_LIMIT {
+            return self.complete_in_parts(token, &id, lease, video, size).await;
         }
         let file = tokio::fs::File::open(video).await?;
         let stream = tokio_util::io::ReaderStream::new(file);
@@ -197,7 +214,7 @@ impl Api {
             .part("video", part);
         let response = self
             .client
-            .post(self.same_origin_url(url)?)
+            .post(expected)
             .bearer_auth(token)
             .timeout(Duration::from_secs(1800))
             .multipart(form)
@@ -206,6 +223,129 @@ impl Api {
             .context("Could not send the finished render to Ferris")?;
         check_status(&response)?;
         Ok(())
+    }
+
+    async fn complete_in_parts(
+        &self,
+        token: &str,
+        id: &uuid::Uuid,
+        lease: &str,
+        video: &Path,
+        size: u64,
+    ) -> Result<()> {
+        let digest = sha256_file(video, size).await?;
+        let parts = size.div_ceil(VIDEO_PART_SIZE);
+        for index in 0..parts {
+            let offset = index * VIDEO_PART_SIZE;
+            let length = (size - offset).min(VIDEO_PART_SIZE);
+            let url = self.endpoint(&format!("jobs/{id}/upload/{index}"))?;
+            for attempt in 0..3 {
+                let mut file = tokio::fs::File::open(video).await?;
+                file.seek(SeekFrom::Start(offset)).await?;
+                let stream = tokio_util::io::ReaderStream::new(file.take(length));
+                let response = self
+                    .client
+                    .put(url.clone())
+                    .bearer_auth(token)
+                    .header("X-Ferris-Lease-Token", lease)
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(reqwest::header::CONTENT_LENGTH, length)
+                    .timeout(Duration::from_secs(300))
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        let receipt: serde_json::Value = match json_response(response).await {
+                            Ok(receipt) => receipt,
+                            Err(error) if attempt == 2 => {
+                                return Err(error)
+                                    .context("Could not confirm a video part receipt");
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                                continue;
+                            }
+                        };
+                        if receipt.get("ok") != Some(&serde_json::Value::Bool(true))
+                            || receipt.get("index").and_then(serde_json::Value::as_u64)
+                                != Some(index)
+                        {
+                            bail!("Ferris returned an invalid video part receipt");
+                        }
+                        break;
+                    }
+                    Ok(response) => {
+                        let retryable = response.status().is_server_error()
+                            || matches!(
+                                response.status(),
+                                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                            );
+                        if !retryable || attempt == 2 {
+                            check_status(&response)?;
+                        }
+                    }
+                    Err(error) if attempt == 2 => {
+                        return Err(error).context("Could not send a video part to Ferris");
+                    }
+                    Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+        let url = self.endpoint(&format!("jobs/{id}/complete-chunks"))?;
+        let body = serde_json::json!({
+            "lease_token": lease,
+            "parts": parts,
+            "total_bytes": size,
+            "sha256": digest,
+        });
+        let expected_id = id.to_string();
+        for attempt in 0..3 {
+            let response = self
+                .client
+                .post(url.clone())
+                .bearer_auth(token)
+                .json(&body)
+                .timeout(Duration::from_secs(300))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    match json_response::<serde_json::Value>(response).await {
+                        Ok(receipt) => {
+                            if receipt.get("ok") != Some(&serde_json::Value::Bool(true))
+                                || receipt.get("id").and_then(serde_json::Value::as_str)
+                                    != Some(expected_id.as_str())
+                            {
+                                bail!("Ferris returned an invalid video completion receipt");
+                            }
+                            return Ok(());
+                        }
+                        Err(error) if attempt == 2 => {
+                            return Err(error).context("Could not confirm video completion");
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Ok(response) => {
+                    let retryable = response.status().is_server_error()
+                        || matches!(
+                            response.status(),
+                            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                        );
+                    if !retryable || attempt == 2 {
+                        check_status(&response)?;
+                    }
+                }
+                Err(error) if attempt == 2 => {
+                    return Err(error).context("Could not finalize the uploaded video");
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+        }
+        bail!("Could not finalize the uploaded video")
     }
 
     pub async fn manifest(&self) -> Result<serde_json::Value> {
@@ -277,6 +417,28 @@ impl Api {
         }
         bail!("Too many release download redirects")
     }
+}
+
+async fn sha256_file(path: &Path, expected_size: u64) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let count = file.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > expected_size {
+            bail!("The rendered video changed while preparing its upload");
+        }
+        digest.update(&buffer[..count]);
+    }
+    if bytes != expected_size {
+        bail!("The rendered video changed while preparing its upload");
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 pub fn validate_transport(url: &Url) -> Result<()> {
